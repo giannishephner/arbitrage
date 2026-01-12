@@ -26,7 +26,7 @@ interface StrategyConfig {
     enableHedging: boolean;           // Включить умное хеджирование
     hedgePriceThreshold: number;      // Макс. цена для хеджа (0.20 = 20¢)
     hedgeBetSize: number;             // Размер хедж-ставки USDC
-    hedgeOnlyWhenLosing: boolean;     // Хедж только если основная в минусе
+    hedgeOnlyWhenLosing: boolean;     // Хедж только если основная в минусе (будущая функция)
     
     // Тайминг
     cooldownSeconds: number;          // Пауза между ставками
