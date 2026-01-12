@@ -29,13 +29,49 @@ interface BotConfig {
     asset: "btc" | "eth" | "sol" | "xrp";
 }
 
+// ============== ВАЛИДАЦИЯ КОНФИГУРАЦИИ ==============
+
+function validateConfig(): void {
+    const errors: string[] = [];
+    
+    if (!process.env.PRIVATE_KEY || process.env.PRIVATE_KEY.trim() === "") {
+        errors.push("❌ PRIVATE_KEY не установлен в .env файле");
+    }
+    
+    if (!process.env.FUNDER_ADDRESS || process.env.FUNDER_ADDRESS.trim() === "") {
+        errors.push("❌ FUNDER_ADDRESS не установлен в .env файле");
+    }
+    
+    if (errors.length > 0) {
+        console.error("\n🚨 ОШИБКА КОНФИГУРАЦИИ:\n");
+        errors.forEach(err => console.error(err));
+        console.error("\nПроверьте файл .env и убедитесь, что все необходимые параметры установлены.\n");
+        process.exit(1);
+    }
+}
+
+// Автоматическое определение signatureType
+// 0 = MetaMask (приватный ключ начинается с 0x), 1 = Email/Magic
+function detectSignatureType(privateKey: string): 0 | 1 {
+    // Если приватный ключ в формате MetaMask (с 0x или 64 hex символа), используем 0
+    // В противном случае, используем 1 для Email/Magic
+    const cleanKey = privateKey.trim();
+    if (cleanKey.startsWith("0x") || /^[0-9a-fA-F]{64}$/.test(cleanKey)) {
+        return 0;
+    }
+    return 1;
+}
+
+// Валидируем конфигурацию при загрузке
+validateConfig();
+
 const botConfig: BotConfig = {
     polymarketHost: "https://clob.polymarket.com",
     gammaApiHost: "https://gamma-api.polymarket.com",
     chainId: 137 as Chain,
     privateKey: process.env.PRIVATE_KEY || "",
     funderAddress: process.env.FUNDER_ADDRESS || "",
-    signatureType: 1,
+    signatureType: detectSignatureType(process.env.PRIVATE_KEY || ""),
     
     // ========== НАСТРОЙКИ СТРАТЕГИИ ==========
     minEdgePercent: 2.0,              // Минимальный edge для входа (было 5%)
@@ -203,6 +239,8 @@ interface Market15m {
     downPrice: number;
     endTimestamp: number;
     active: boolean;
+    minimumTickSize?: string;
+    negRisk?: boolean;
 }
 
 class GammaApiClient {
@@ -243,6 +281,8 @@ class GammaApiClient {
                 downPrice: prices[1] || 0.5,
                 endTimestamp,
                 active: m.active && ! m.closed,
+                minimumTickSize: m.minimumTickSize || "0.01",
+                negRisk: m.negRisk || false,
             };
         } catch {
             return null;
@@ -274,12 +314,21 @@ interface MarketPrices {
     downTokenId: string;
     slug: string;
     marketBias: "UP" | "DOWN" | "NEUTRAL";
+    minimumTickSize?: string;
+    negRisk?: boolean;
+}
+
+interface BetResult {
+    success: boolean;
+    orderId?: string;
+    error?: string;
 }
 
 class PolymarketService {
     private clobClient: ClobClient;
     private gammaClient: GammaApiClient;
     private creds: ApiKeyCreds | null = null;
+    private initialized: boolean = false;
 
     constructor(private config: BotConfig) {
         const signer = new Wallet(config.privateKey);
@@ -288,12 +337,16 @@ class PolymarketService {
     }
 
     async initialize(): Promise<void> {
-        console.log("🔑 Инициализация...");
+        console.log("🔑 Инициализация API...");
         try {
             this.creds = await this.clobClient.createOrDeriveApiKey();
-        } catch {}
+            
+            if (!this.creds) {
+                throw new Error("Не удалось получить API ключи");
+            }
+            
+            console.log("✅ API ключи получены");
 
-        if (this.creds) {
             const signer = new Wallet(this.config.privateKey);
             this.clobClient = new ClobClient(
                 this.config.polymarketHost,
@@ -303,8 +356,21 @@ class PolymarketService {
                 this.config.signatureType,
                 this.config.funderAddress
             );
+            
+            // Проверяем соединение
+            try {
+                await this.clobClient.isOrderScoring();
+                console.log("✅ Соединение с сервером установлено");
+            } catch (err) {
+                console.warn("⚠️ Не удалось проверить соединение с сервером:", err);
+            }
+            
+            this.initialized = true;
+            console.log("✅ Инициализация завершена успешно");
+        } catch (error) {
+            console.error("❌ Ошибка инициализации API:", error);
+            throw new Error(`Не удалось инициализировать API: ${error}`);
         }
-        console.log("✅ Готово");
     }
 
     async getMarketPrices(): Promise<MarketPrices> {
@@ -336,19 +402,79 @@ class PolymarketService {
             downTokenId:  market.downTokenId,
             slug:  market.slug,
             marketBias,
+            minimumTickSize: market.minimumTickSize,
+            negRisk: market.negRisk,
         };
     }
 
-    async placeBet(tokenId: string, price: number, size: number): Promise<any> {
-        if (!this.creds) throw new Error("No API key");
+    async placeBet(tokenId: string, price: number, size: number, tickSize: string = "0.01", negRisk: boolean = false): Promise<BetResult> {
+        if (!this.initialized || !this.creds) {
+            return {
+                success: false,
+                error: "API не инициализирован"
+            };
+        }
 
-        console.log(`📝 Ставка:  ${tokenId.substring(0, 20)}...@ ${price} x ${size} USDC`);
+        try {
+            console.log(`📝 Размещение ордера:`);
+            console.log(`   Token: ${tokenId.substring(0, 20)}...`);
+            console.log(`   Цена: ${price} USDC`);
+            console.log(`   Размер: ${size} USDC`);
+            console.log(`   TickSize: ${tickSize}, NegRisk: ${negRisk}`);
 
-        return await this.clobClient.createAndPostOrder(
-            { tokenID: tokenId, price, side: Side.BUY, size },
-            { tickSize: "0.01" as any, negRisk: false },
-            OrderType.GTC, false, false
-        );
+            const result = await this.clobClient.createAndPostOrder(
+                { tokenID: tokenId, price, side: Side.BUY, size },
+                { tickSize: tickSize as any, negRisk },
+                OrderType.GTC, false, false
+            );
+
+            if (result && result.orderID) {
+                console.log(`✅ Ордер размещён успешно! OrderID: ${result.orderID}`);
+                return {
+                    success: true,
+                    orderId: result.orderID
+                };
+            } else if (result && result.error) {
+                console.error(`❌ Ошибка размещения ордера: ${result.error}`);
+                return {
+                    success: false,
+                    error: result.error
+                };
+            } else {
+                console.warn(`⚠️ Неизвестный ответ от API:`, result);
+                return {
+                    success: false,
+                    error: "Неизвестный ответ от API"
+                };
+            }
+        } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            console.error(`❌ Исключение при размещении ордера:`, errorMsg);
+            return {
+                success: false,
+                error: errorMsg
+            };
+        }
+    }
+
+    async getBalance(): Promise<number | null> {
+        if (!this.initialized || !this.creds) {
+            console.warn("⚠️ Невозможно получить баланс: API не инициализирован");
+            return null;
+        }
+
+        try {
+            const balances = await this.clobClient.getBalanceAllowance();
+            if (balances && balances.balance) {
+                const usdcBalance = parseFloat(balances.balance);
+                console.log(`💰 Баланс USDC: ${usdcBalance.toFixed(2)}`);
+                return usdcBalance;
+            }
+            return null;
+        } catch (error) {
+            console.error("❌ Ошибка при получении баланса:", error);
+            return null;
+        }
     }
 }
 
@@ -480,7 +606,7 @@ class ArbitrageBot {
     private running = false;
     private lastTradeTime = 0;
     private lastLog = 0;
-    private stats = { trades: 0, opportunities: 0, wins: 0, losses: 0 };
+    private stats = { trades: 0, opportunities: 0, successfulOrders: 0, failedOrders: 0 };
 
     constructor(private config: BotConfig) {
         this.priceFeed = new BinancePriceFeed(config.asset);
@@ -498,6 +624,12 @@ class ArbitrageBot {
 
         await this.priceFeed.connect();
         await this.polymarket.initialize();
+        
+        // Проверяем баланс (опционально)
+        const balance = await this.polymarket.getBalance();
+        if (balance !== null && balance < this.config.betSizeUsdc) {
+            console.warn(`⚠️ ПРЕДУПРЕЖДЕНИЕ: Баланс (${balance.toFixed(2)} USDC) меньше размера ставки (${this.config.betSizeUsdc} USDC)`);
+        }
 
         console.log("⏳ Накапливаем данные (60 сек)...");
         await this.sleep(60000);
@@ -534,13 +666,23 @@ class ArbitrageBot {
                         const price = a.direction === "UP"
                             ? Math.min(a.marketPrices.upPrice + 0.01, 0.95)
                             : Math.min(a.marketPrices.downPrice + 0.01, 0.95);
-                        await this.polymarket.placeBet(tokenId, price, this.config.betSizeUsdc);
+                        
+                        const tickSize = a.marketPrices.minimumTickSize || "0.01";
+                        const negRisk = a.marketPrices.negRisk || false;
+                        
+                        const result = await this.polymarket.placeBet(tokenId, price, this.config.betSizeUsdc, tickSize, negRisk);
+                        
+                        if (result.success) {
+                            this.stats.successfulOrders++;
+                            console.log(`✅ Ордер успешно размещён! ID: ${result.orderId}\n`);
+                        } else {
+                            this.stats.failedOrders++;
+                            console.error(`❌ Не удалось разместить ордер: ${result.error}\n`);
+                        }
+                        
                         this.stats.trades++;
                         this.lastTradeTime = Date.now();
                     }
-                    
-
-                    console.log(`   ⚠️ СИМУЛЯЦИЯ\n`);
                 }
 
                 await this.sleep(1000);
@@ -568,7 +710,7 @@ class ArbitrageBot {
 │ 🧠 ${a.direction} | Оценка: ${(a.realProbability * 100).toFixed(1)}% | Edge: ${a.edge.toFixed(2)}% | Уверенность: ${(a.confidence * 100).toFixed(0)}%
 │ 💬 ${a.reason}
 ├───────────────────────────────────────────────────────────────┤
-│ 📊 Возможностей: ${this.stats.opportunities} | Сделок: ${this.stats.trades}
+│ 📊 Возможностей: ${this.stats.opportunities} | Сделок: ${this.stats.trades} | ✅ Успешно: ${this.stats.successfulOrders} | ❌ Неудачно: ${this.stats.failedOrders}
 └───────────────────────────────────────────────────────────────┘`);
     }
 
