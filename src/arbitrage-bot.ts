@@ -14,6 +14,29 @@ dotenvConfig({ path: resolve(__dirname, "../.env") });
 
 // ============== КОНФИГУРАЦИЯ ==============
 
+interface StrategyConfig {
+    mode: "CONSERVATIVE" | "BALANCED" | "AGGRESSIVE";
+    
+    // Основные параметры
+    minEdgePercent: number;           // Мин. edge для основной ставки
+    mainBetSize: number;              // Размер основной ставки USDC
+    maxBetsPerMarket: number;         // Макс. ставок на один рынок
+    
+    // Хеджирование
+    enableHedging: boolean;           // Включить умное хеджирование
+    hedgePriceThreshold: number;      // Макс. цена для хеджа (0.20 = 20¢)
+    hedgeBetSize: number;             // Размер хедж-ставки USDC
+    hedgeOnlyWhenLosing: boolean;     // Хедж только если основная в минусе
+    
+    // Тайминг
+    cooldownSeconds: number;          // Пауза между ставками
+    noTradeLastMinutes: number;       // Не торговать последние N минут периода
+    
+    // Риск-менеджмент
+    maxDailyLoss: number;             // Стоп-лосс на день USDC
+    maxConsecutiveLosses: number;     // Стоп после N проигрышей подряд
+}
+
 interface BotConfig {
     polymarketHost: string;
     gammaApiHost: string;
@@ -21,12 +44,10 @@ interface BotConfig {
     privateKey: string;
     funderAddress: string;
     signatureType: 0 | 1;
-    minEdgePercent:  number;
-    betSizeUsdc: number;
     momentumWindowSeconds: number;
     momentumThresholdPercent: number;
-    cooldownSeconds:  number;
     asset: "btc" | "eth" | "sol" | "xrp";
+    strategy: StrategyConfig;
 }
 
 const botConfig: BotConfig = {
@@ -37,15 +58,34 @@ const botConfig: BotConfig = {
     funderAddress: process.env.FUNDER_ADDRESS || "",
     signatureType: 1,
     
-    // ========== НАСТРОЙКИ СТРАТЕГИИ ==========
-    minEdgePercent: 2.0,              // Минимальный edge для входа (было 5%)
-    betSizeUsdc:  5,                  // Размер ставки
-    momentumWindowSeconds: 60,         // Окно анализа (было 30 сек)
-    momentumThresholdPercent: 0.05,   // Порог моментума (было 0.15%)
-    cooldownSeconds: 30,               // Пауза между сделками
-    // =========================================
+    momentumWindowSeconds: 60,         // Окно анализа
+    momentumThresholdPercent: 0.05,   // Порог моментума
     
     asset: "btc",
+    
+    // ========== НОВАЯ СТРАТЕГИЯ: SMART HEDGING + HIGH EDGE ==========
+    strategy: {
+        mode: "BALANCED",
+        
+        // Основные параметры
+        minEdgePercent: 5.0,
+        mainBetSize: 15,
+        maxBetsPerMarket: 2,  // 1 основная + 1 хедж
+        
+        // Хеджирование
+        enableHedging: true,
+        hedgePriceThreshold: 0.20,  // Хедж только если цена < 20¢
+        hedgeBetSize: 7,
+        hedgeOnlyWhenLosing: false,
+        
+        // Тайминг
+        cooldownSeconds: 60,
+        noTradeLastMinutes: 2,  // Не торговать последние 2 мин
+        
+        // Риск-менеджмент
+        maxDailyLoss: 50,
+        maxConsecutiveLosses: 5,
+    },
 };
 
 // ============== BINANCE PRICE FEED ==============
@@ -354,6 +394,44 @@ class PolymarketService {
 
 // ============== УЛУЧШЕННАЯ СТРАТЕГИЯ ==============
 
+interface MarketPosition {
+    slug: string;
+    mainBet: {
+        direction: "UP" | "DOWN";
+        price: number;
+        size: number;
+        timestamp: number;
+    } | null;
+    hedgeBet: {
+        direction: "UP" | "DOWN";
+        price: number;
+        size: number;
+        timestamp: number;
+    } | null;
+    totalBets: number;
+}
+
+interface TradeDecision {
+    action: "BET" | "SKIP";
+    type?: "MAIN" | "HEDGE";
+    direction?: "UP" | "DOWN";
+    size?: number;
+    reason: string;
+}
+
+interface Scenarios {
+    ifMainWins: {
+        payout: number;
+        profit: number;
+        roi: number;
+    };
+    ifMainLoses: {
+        payout: number;
+        profit: number;
+        roi: number;
+    };
+}
+
 interface AnalysisResult {
     price: number | null;
     momentum: number | null;
@@ -369,11 +447,183 @@ interface AnalysisResult {
 }
 
 class ImprovedStrategy {
+    private positions = new Map<string, MarketPosition>();
+    private dailyLoss = 0;
+    private consecutiveLosses = 0;
+    private dailyLossResetTime = 0;
+
     constructor(
         private priceFeed: BinancePriceFeed,
         private polymarket: PolymarketService,
         private config: BotConfig
-    ) {}
+    ) {
+        this.resetDailyStats();
+    }
+
+    private resetDailyStats(): void {
+        const now = Date.now();
+        const today = new Date(now);
+        today.setHours(0, 0, 0, 0);
+        this.dailyLossResetTime = today.getTime() + 24 * 60 * 60 * 1000;
+    }
+
+    private checkDailyReset(): void {
+        const now = Date.now();
+        if (now >= this.dailyLossResetTime) {
+            this.dailyLoss = 0;
+            this.resetDailyStats();
+        }
+    }
+
+    private parseTimeLeft(timeLeft: string): number {
+        // Парсит "8м 45с" -> 8.75 минут
+        const match = timeLeft.match(/(\d+)м/);
+        return match ? parseInt(match[1]) : 0;
+    }
+
+    async evaluateTrade(analysis: AnalysisResult): Promise<TradeDecision> {
+        const { marketPrices, direction, edge, confidence } = analysis;
+        const slug = marketPrices.slug;
+
+        // Проверка риск-менеджмента
+        this.checkDailyReset();
+        if (this.dailyLoss >= this.config.strategy.maxDailyLoss) {
+            return { action: "SKIP", reason: `Достигнут дневной лимит убытков: $${this.dailyLoss.toFixed(2)}` };
+        }
+        if (this.consecutiveLosses >= this.config.strategy.maxConsecutiveLosses) {
+            return { action: "SKIP", reason: `Достигнут лимит проигрышей подряд: ${this.consecutiveLosses}` };
+        }
+
+        // Получаем или создаём позицию
+        let position = this.positions.get(slug);
+        if (!position) {
+            position = { slug, mainBet: null, hedgeBet: null, totalBets: 0 };
+            this.positions.set(slug, position);
+        }
+
+        // Проверка лимитов
+        if (position.totalBets >= this.config.strategy.maxBetsPerMarket) {
+            return { action: "SKIP", reason: "Лимит ставок на рынок" };
+        }
+
+        // Проверка времени (не торгуем в конце периода)
+        const timeLeftMinutes = this.parseTimeLeft(marketPrices.timeLeft);
+        if (timeLeftMinutes < this.config.strategy.noTradeLastMinutes) {
+            return { action: "SKIP", reason: `Слишком мало времени: ${timeLeftMinutes}м` };
+        }
+
+        // ОСНОВНАЯ СТАВКА
+        if (!position.mainBet && edge >= this.config.strategy.minEdgePercent && direction !== "NEUTRAL") {
+            return {
+                action: "BET",
+                type: "MAIN",
+                direction,
+                size: this.config.strategy.mainBetSize,
+                reason: `Основная ставка: edge ${edge.toFixed(1)}%, уверенность ${(confidence * 100).toFixed(0)}%`
+            };
+        }
+
+        // ХЕДЖ-СТАВКА
+        if (this.config.strategy.enableHedging && position.mainBet && !position.hedgeBet) {
+            const oppositeDirection = position.mainBet.direction === "UP" ? "DOWN" : "UP";
+            const oppositePrice = oppositeDirection === "UP" 
+                ? marketPrices.upPrice 
+                : marketPrices.downPrice;
+
+            // Хедж только при низкой цене
+            if (oppositePrice <= this.config.strategy.hedgePriceThreshold) {
+                const potentialMultiplier = 1 / oppositePrice;
+                return {
+                    action: "BET",
+                    type: "HEDGE",
+                    direction: oppositeDirection,
+                    size: this.config.strategy.hedgeBetSize,
+                    reason: `Хедж: цена ${(oppositePrice * 100).toFixed(0)}¢, потенциал x${potentialMultiplier.toFixed(1)}`
+                };
+            }
+        }
+
+        return { action: "SKIP", reason: "Нет подходящих условий" };
+    }
+
+    recordBet(slug: string, type: "MAIN" | "HEDGE", direction: "UP" | "DOWN", price: number, size: number): void {
+        let position = this.positions.get(slug);
+        if (!position) {
+            position = { slug, mainBet: null, hedgeBet: null, totalBets: 0 };
+            this.positions.set(slug, position);
+        }
+
+        const bet = { direction, price, size, timestamp: Date.now() };
+        
+        if (type === "MAIN") {
+            position.mainBet = bet;
+        } else {
+            position.hedgeBet = bet;
+        }
+        
+        position.totalBets++;
+    }
+
+    calculateScenarios(slug: string, prices: MarketPrices): Scenarios | null {
+        const position = this.positions.get(slug);
+        if (!position || !position.mainBet) return null;
+
+        const main = position.mainBet;
+        const hedge = position.hedgeBet;
+
+        const mainWinPayout = main.size / main.price;  // Выплата если основная выиграла
+        const hedgeWinPayout = hedge ? hedge.size / hedge.price : 0;
+
+        const totalInvested = main.size + (hedge?.size || 0);
+
+        return {
+            ifMainWins: {
+                payout: mainWinPayout,
+                profit: mainWinPayout - totalInvested,
+                roi: ((mainWinPayout - totalInvested) / totalInvested) * 100
+            },
+            ifMainLoses: {
+                payout: hedgeWinPayout,
+                profit: hedgeWinPayout - totalInvested,
+                roi: hedgeWinPayout > 0 ? ((hedgeWinPayout - totalInvested) / totalInvested) * 100 : -100
+            }
+        };
+    }
+
+    getPosition(slug: string): MarketPosition | null {
+        return this.positions.get(slug) || null;
+    }
+
+    cleanupOldPositions(currentSlug: string): void {
+        // Очищаем позиции для старых рынков
+        const toDelete: string[] = [];
+        for (const [slug, position] of this.positions.entries()) {
+            if (slug !== currentSlug) {
+                toDelete.push(slug);
+            }
+        }
+        for (const slug of toDelete) {
+            this.positions.delete(slug);
+        }
+    }
+
+    getStats(): { totalPositions: number; mainBets: number; hedgeBets: number; dailyLoss: number; consecutiveLosses: number } {
+        let mainBets = 0;
+        let hedgeBets = 0;
+        
+        for (const position of this.positions.values()) {
+            if (position.mainBet) mainBets++;
+            if (position.hedgeBet) hedgeBets++;
+        }
+
+        return {
+            totalPositions: this.positions.size,
+            mainBets,
+            hedgeBets,
+            dailyLoss: this.dailyLoss,
+            consecutiveLosses: this.consecutiveLosses
+        };
+    }
 
     async analyze(): Promise<AnalysisResult> {
         const price = this.priceFeed.getCurrentPrice();
@@ -447,7 +697,7 @@ class ImprovedStrategy {
         const edge = (realProbability - marketProb) * 100;
 
         // Решение о торговле
-        const shouldTrade = edge >= this.config.minEdgePercent && 
+        const shouldTrade = edge >= this.config.strategy.minEdgePercent && 
                            direction !== "NEUTRAL" && 
                            marketPrices.found &&
                            confidence >= 0.3;
@@ -456,7 +706,7 @@ class ImprovedStrategy {
         if (!marketPrices.found) reason = "Рынок не найден";
         else if (direction === "NEUTRAL") reason = `Моментум ${momentum.toFixed(4)}% < порог ${threshold}%`;
         else if (confidence < 0.3) reason = `Низкая уверенность ${(confidence * 100).toFixed(0)}%`;
-        else if (edge < this.config.minEdgePercent) reason = `Edge ${edge.toFixed(2)}% < мин ${this.config.minEdgePercent}%`;
+        else if (edge < this.config.strategy.minEdgePercent) reason = `Edge ${edge.toFixed(2)}% < мин ${this.config.strategy.minEdgePercent}%`;
         else reason = "✅ Сигнал! ";
 
         return {
@@ -480,7 +730,15 @@ class ArbitrageBot {
     private running = false;
     private lastTradeTime = 0;
     private lastLog = 0;
-    private stats = { trades: 0, opportunities: 0, wins: 0, losses: 0 };
+    private currentSlug = "";
+    private stats = { 
+        trades: 0, 
+        opportunities: 0, 
+        wins: 0, 
+        losses: 0,
+        mainBets: 0,
+        hedgeBets: 0
+    };
 
     constructor(private config: BotConfig) {
         this.priceFeed = new BinancePriceFeed(config.asset);
@@ -489,12 +747,15 @@ class ArbitrageBot {
     }
 
     async start(): Promise<void> {
+        const cfg = this.config.strategy;
         console.log(`
-╔═══════���═══════════════════════════════════════════════════════╗
-║  🤖 POLYMARKET ${this.config.asset.toUpperCase()} 15-MIN ARBITRAGE BOT v2          ║
-╠═══════════════════════════════════════════════════════════════╣
-║  Edge: ${this.config.minEdgePercent}% | Порог: ${this.config.momentumThresholdPercent}% | Окно: ${this.config.momentumWindowSeconds}s | Ставка: $${this.config.betSizeUsdc}  ║
-╚═══════════════════════════════════════════════════════════════╝`);
+╔═══════════════════════════════════════════════════════════╗
+║  🤖 POLYMARKET ${this.config.asset.toUpperCase()} 15-MIN ARBITRAGE BOT v3          ║
+╠═══════════════════════════════════════════════════════════╣
+║  Режим: ${cfg.mode.padEnd(12)} | Edge: ${cfg.minEdgePercent}% | Ставка: $${cfg.mainBetSize}    ║
+║  Хедж: ${cfg.enableHedging ? "ВКЛ" : "ВЫКЛ"} (${(cfg.hedgePriceThreshold * 100).toFixed(0)}¢) | Размер: $${cfg.hedgeBetSize}                ║
+║  Лимит рынок: ${cfg.maxBetsPerMarket} | Кулдаун: ${cfg.cooldownSeconds}с                    ║
+╚═══════════════════════════════════════════════════════════╝`);
 
         await this.priceFeed.connect();
         await this.polymarket.initialize();
@@ -513,34 +774,77 @@ class ArbitrageBot {
                 const a = await this.strategy.analyze();
                 const now = Date.now();
 
+                // Очищаем старые позиции при смене рынка
+                if (this.currentSlug && this.currentSlug !== a.marketPrices.slug) {
+                    this.strategy.cleanupOldPositions(a.marketPrices.slug);
+                }
+                this.currentSlug = a.marketPrices.slug;
+
                 if (now - this.lastLog >= 3000) {
                     this.printStatus(a);
                     this.lastLog = now;
                 }
 
-                if ((now - this.lastTradeTime) / 1000 < this.config.cooldownSeconds && this.lastTradeTime > 0) {
+                if ((now - this.lastTradeTime) / 1000 < this.config.strategy.cooldownSeconds && this.lastTradeTime > 0) {
                     await this.sleep(1000);
                     continue;
                 }
 
-                if (a.shouldTrade) {
+                // Используем новую логику evaluateTrade
+                const decision = await this.strategy.evaluateTrade(a);
+
+                if (decision.action === "BET" && decision.direction && decision.size && decision.type) {
                     this.stats.opportunities++;
-                    const tokenId = a.direction === "UP" ?  a.marketPrices.upTokenId : a.marketPrices.downTokenId;
-
-                    console.log(`\n🎯 ${a.direction} | Edge: ${a.edge.toFixed(2)}% | Уверенность: ${(a.confidence * 100).toFixed(0)}%`);
-
-
-                    if (tokenId) {
-                        const price = a.direction === "UP"
-                            ? Math.min(a.marketPrices.upPrice + 0.01, 0.95)
-                            : Math.min(a.marketPrices.downPrice + 0.01, 0.95);
-                        await this.polymarket.placeBet(tokenId, price, this.config.betSizeUsdc);
-                        this.stats.trades++;
-                        this.lastTradeTime = Date.now();
-                    }
                     
+                    const tokenId = decision.direction === "UP" 
+                        ? a.marketPrices.upTokenId 
+                        : a.marketPrices.downTokenId;
+                    
+                    const price = decision.direction === "UP"
+                        ? a.marketPrices.upPrice
+                        : a.marketPrices.downPrice;
 
-                    console.log(`   ⚠️ СИМУЛЯЦИЯ\n`);
+                    console.log(`\n🎯 ${decision.type === "MAIN" ? "ОСНОВНАЯ" : "ХЕДЖ"} СТАВКА: ${decision.direction}`);
+                    console.log(`   ${decision.reason}`);
+                    console.log(`   Цена: ${(price * 100).toFixed(1)}¢ | Размер: $${decision.size}`);
+
+                    // Записываем ставку в позицию
+                    this.strategy.recordBet(
+                        a.marketPrices.slug,
+                        decision.type,
+                        decision.direction,
+                        price,
+                        decision.size
+                    );
+
+                    if (decision.type === "MAIN") {
+                        this.stats.mainBets++;
+                    } else {
+                        this.stats.hedgeBets++;
+                    }
+
+                    // Показываем сценарии если есть позиция
+                    const scenarios = this.strategy.calculateScenarios(a.marketPrices.slug, a.marketPrices);
+                    if (scenarios) {
+                        console.log(`\n📈 Сценарии:`);
+                        const position = this.strategy.getPosition(a.marketPrices.slug);
+                        if (position && position.mainBet) {
+                            console.log(`   Если ${position.mainBet.direction} выигрывает: ${scenarios.ifMainWins.profit >= 0 ? "+" : ""}$${scenarios.ifMainWins.profit.toFixed(2)} (${scenarios.ifMainWins.roi >= 0 ? "+" : ""}${scenarios.ifMainWins.roi.toFixed(1)}% ROI)`);
+                            console.log(`   Если ${position.mainBet.direction === "UP" ? "DOWN" : "UP"} выигрывает: ${scenarios.ifMainLoses.profit >= 0 ? "+" : ""}$${scenarios.ifMainLoses.profit.toFixed(2)} (${scenarios.ifMainLoses.roi >= 0 ? "+" : ""}${scenarios.ifMainLoses.roi.toFixed(1)}% ROI)${scenarios.ifMainLoses.profit > 0 ? " ← Хедж окупается!" : ""}`);
+                        }
+                    }
+
+                    // Реальная ставка (раскомментируйте для продакшена)
+                    // if (tokenId) {
+                    //     await this.polymarket.placeBet(tokenId, Math.min(price + 0.01, 0.95), decision.size);
+                    //     this.stats.trades++;
+                    //     this.lastTradeTime = Date.now();
+                    // }
+                    
+                    console.log(`   ⚠️ СИМУЛЯЦИЯ (раскомментируйте код для реальных ставок)\n`);
+                } else if (decision.action === "SKIP" && a.shouldTrade) {
+                    // Если есть торговый сигнал, но evaluateTrade отклонила
+                    console.log(`\n⏭️  Пропуск: ${decision.reason}`);
                 }
 
                 await this.sleep(1000);
@@ -557,19 +861,31 @@ class ArbitrageBot {
         const trendIcon = a.trend.direction.includes("STRONG") ? "💪" : 
                          a.trend.direction.includes("WEAK") ? "〰️" : "➖";
 
+        const stratStats = this.strategy.getStats();
+        const position = this.strategy.getPosition(a.marketPrices.slug);
+
+        let positionInfo = "";
+        if (position && position.mainBet) {
+            positionInfo = `\n│ 💰 Позиция:`;
+            positionInfo += `\n│    └─ Основная: ${position.mainBet.direction} $${position.mainBet.size} @ ${(position.mainBet.price * 100).toFixed(0)}¢`;
+            if (position.hedgeBet) {
+                const potentialMultiplier = 1 / position.hedgeBet.price;
+                positionInfo += `\n│    └─ Хедж: ${position.hedgeBet.direction} $${position.hedgeBet.size} @ ${(position.hedgeBet.price * 100).toFixed(0)}¢ (потенциал x${potentialMultiplier.toFixed(1)})`;
+            }
+        }
+
         console.log(`
-┌───────────────────────────────────────────────────────────────┐
-│ ${arrow} ${this.config.asset.toUpperCase()}: $${a.price?.toFixed(2) || "N/A"}  Mom: ${a.momentum?.toFixed(4) || "N/A"}%  Vol: ${a.volatility?.toFixed(3) || "N/A"}%
-│ ${trendIcon} Тренд: ${a.trend.direction}  (30s:  ${a.trend.short?.toFixed(4) || "N/A"}% | 2m: ${a.trend.medium?.toFixed(4) || "N/A"}%)
-├───────────────────────────────────────────────────────────────┤
+┌─────────────────────────────────────────────────────────────┐
+│ ${arrow} ${this.config.asset.toUpperCase()}: $${a.price?.toFixed(2) || "N/A"}  Моментум: ${a.momentum?.toFixed(2) || "N/A"}%  Тренд: ${a.trend.direction}
+├─────────────────────────────────────────────────────────────┤
 │ 🎰 ${a.marketPrices.slug || "N/A"}
-│    UP: ${(a.marketPrices.upPrice * 100).toFixed(1)}%  DOWN: ${(a.marketPrices.downPrice * 100).toFixed(1)}%  ⏱️ ${a.marketPrices.timeLeft}  Bias: ${a.marketPrices.marketBias}
-├───────────────────────────────────────────────────────────────┤
-│ 🧠 ${a.direction} | Оценка: ${(a.realProbability * 100).toFixed(1)}% | Edge: ${a.edge.toFixed(2)}% | Уверенность: ${(a.confidence * 100).toFixed(0)}%
+│    UP: ${(a.marketPrices.upPrice * 100).toFixed(0)}%  DOWN: ${(a.marketPrices.downPrice * 100).toFixed(0)}%  ⏱️ ${a.marketPrices.timeLeft}${positionInfo}
+├─────────────────────────────────────────────────────────────┤
+│ 🧠 Направление: ${a.direction} | Наш edge: ${a.edge.toFixed(1)}%
 │ 💬 ${a.reason}
-├───────────────────────────────────────────────────────────────┤
-│ 📊 Возможностей: ${this.stats.opportunities} | Сделок: ${this.stats.trades}
-└───────────────────────────────────────────────────────────────┘`);
+├─────────────────────────────────────────────────────────────┤
+│ 📊 Основных: ${stratStats.mainBets} | Хеджей: ${stratStats.hedgeBets} | Возможностей: ${this.stats.opportunities}
+└─────────────────────────────────────────────────────────────┘`);
     }
 
     stop(): void {
