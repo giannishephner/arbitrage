@@ -48,6 +48,7 @@ interface BotConfig {
     momentumThresholdPercent: number;
     asset: "btc" | "eth" | "sol" | "xrp";
     strategy: StrategyConfig;
+    simulationMode: boolean;           // Режим симуляции (без реальных ставок)
 }
 
 const botConfig: BotConfig = {
@@ -62,6 +63,8 @@ const botConfig: BotConfig = {
     momentumThresholdPercent: 0.05,   // Порог моментума
     
     asset: "btc",
+    
+    simulationMode: true,              // ⚠️ РЕЖИМ СИМУЛЯЦИИ: измените на false для реальных ставок
     
     // ========== НОВАЯ СТРАТЕГИЯ: SMART HEDGING + HIGH EDGE ==========
     strategy: {
@@ -477,8 +480,13 @@ class ImprovedStrategy {
 
     private parseTimeLeft(timeLeft: string): number {
         // Парсит "8м 45с" -> 8.75 минут
-        const match = timeLeft.match(/(\d+)м/);
-        return match ? parseInt(match[1]) : 0;
+        const minutesMatch = timeLeft.match(/(\d+)м/);
+        const secondsMatch = timeLeft.match(/(\d+)с/);
+        
+        const minutes = minutesMatch ? parseInt(minutesMatch[1]) : 0;
+        const seconds = secondsMatch ? parseInt(secondsMatch[1]) : 0;
+        
+        return minutes + seconds / 60;
     }
 
     async evaluateTrade(analysis: AnalysisResult): Promise<TradeDecision> {
@@ -748,10 +756,12 @@ class ArbitrageBot {
 
     async start(): Promise<void> {
         const cfg = this.config.strategy;
+        const simMode = this.config.simulationMode ? "⚠️  СИМУЛЯЦИЯ" : "✅ РЕАЛЬНЫЕ СТАВКИ";
         console.log(`
 ╔═══════════════════════════════════════════════════════════╗
 ║  🤖 POLYMARKET ${this.config.asset.toUpperCase()} 15-MIN ARBITRAGE BOT v3          ║
 ╠═══════════════════════════════════════════════════════════╣
+║  ${simMode.padEnd(30)}                          ║
 ║  Режим: ${cfg.mode.padEnd(12)} | Edge: ${cfg.minEdgePercent}% | Ставка: $${cfg.mainBetSize}    ║
 ║  Хедж: ${cfg.enableHedging ? "ВКЛ" : "ВЫКЛ"} (${(cfg.hedgePriceThreshold * 100).toFixed(0)}¢) | Размер: $${cfg.hedgeBetSize}                ║
 ║  Лимит рынок: ${cfg.maxBetsPerMarket} | Кулдаун: ${cfg.cooldownSeconds}с                    ║
@@ -834,14 +844,15 @@ class ArbitrageBot {
                         }
                     }
 
-                    // Реальная ставка (раскомментируйте для продакшена)
-                    // if (tokenId) {
-                    //     await this.polymarket.placeBet(tokenId, Math.min(price + 0.01, 0.95), decision.size);
-                    //     this.stats.trades++;
-                    //     this.lastTradeTime = Date.now();
-                    // }
-                    
-                    console.log(`   ⚠️ СИМУЛЯЦИЯ (раскомментируйте код для реальных ставок)\n`);
+                    // Реальная или симулированная ставка
+                    if (!this.config.simulationMode && tokenId) {
+                        await this.polymarket.placeBet(tokenId, Math.min(price + 0.01, 0.95), decision.size);
+                        this.stats.trades++;
+                        this.lastTradeTime = Date.now();
+                        console.log(`   ✅ СТАВКА РАЗМЕЩЕНА\n`);
+                    } else {
+                        console.log(`   ⚠️ РЕЖИМ СИМУЛЯЦИИ (установите simulationMode: false для реальных ставок)\n`);
+                    }
                 } else if (decision.action === "SKIP" && a.shouldTrade) {
                     // Если есть торговый сигнал, но evaluateTrade отклонила
                     console.log(`\n⏭️  Пропуск: ${decision.reason}`);
